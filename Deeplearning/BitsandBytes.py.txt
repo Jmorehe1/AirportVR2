@@ -1,0 +1,168 @@
+import os
+import zmq
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, BatchEncoding
+from huggingface_hub import login, logout
+import torch
+from sentence_transformers import SentenceTransformer, util
+import random
+
+# Log in to Hugging Face (token should be secured in env vars in production)
+login("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")
+
+# Function: Convert words to token IDs list
+def get_tokens_as_list(word_list, tokenizer):
+    tokens_list = []
+    for word in word_list:
+        tokenized = tokenizer([word], add_special_tokens=False).input_ids[0]
+        tokens_list.append(tokenized)
+    return tokens_list
+
+# Function to build a strictly alternating history ending on user
+# Ensures we never feed system->assistant->user (skips initial assistant prompts)
+def build_valid_history(messages):
+    cleaned = [messages[0]]  # start with system
+    next_expected = "user"
+    for msg in messages[1:]:
+        role = msg["role"]
+        if role != next_expected:
+            continue
+        cleaned.append(msg)
+        # flip expected role
+        next_expected = "assistant" if next_expected == "user" else "user"
+    # if it ends with assistant, drop it (we need to end on user)
+    if cleaned and cleaned[-1]["role"] == "assistant":
+        cleaned.pop()
+    return cleaned
+
+# Configure 4-bit quantization to fit model into <16GB GPU memory to fit model into <16GB GPU memory
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+# Load models
+print("[START-UP] Loading models with 4-bit quantization...")
+model_name = "migleolop/Sep1FineTune"  # Replace with your model name
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[MODEL] '{model_name}' on device {device}")
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map='auto'
+)
+
+# Prepare bad words IDs once
+tokenizer.model_max_length  # warm-up
+bad_words_ids = get_tokens_as_list([
+    "¡", "Great", "Perfecto", "Entendido", "!", "(", ")", "Haha"
+], tokenizer)
+
+# Initial Question Bank (only first question is used)
+question_bank = [
+    "¿Cómo le ha ido en su viaje?",
+]
+
+# Create initial messages list
+messages = [{
+    "role": "system",
+    "content": (
+        "Siempre habla en español. Eres un agente de aduanas en el aeropuerto. "
+        "Entrevista al usuario sobre la seguridad de su viaje. Nunca hables en inglés. "
+        "Haz solo una pregunta a la vez."
+    )
+}]
+
+print("[START-UP] Model loaded successfully")
+
+# Forward-pass: generate a response given chat history
+def forward_pass(history_msgs, bad_words_ids=bad_words_ids):
+    applied = tokenizer.apply_chat_template(
+        history_msgs,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    )
+
+    if isinstance(applied, (dict, BatchEncoding)):
+        input_ids = applied['input_ids'].to(device)
+        attention_mask = applied.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+    else:
+        input_ids = applied.to(device)
+        attention_mask = None
+
+    gen_kwargs = {
+        'input_ids': input_ids,
+        'bad_words_ids': bad_words_ids,
+        'do_sample': True,
+        'top_k': 30,
+        'max_new_tokens': 512
+    }
+    if attention_mask is not None:
+        gen_kwargs['attention_mask'] = attention_mask
+
+    # Debug: print history being sent to model
+    print("=== HISTORY FOR GENERATION ===")
+    for m in history_msgs:
+        print(f"{m['role']:>9}: {m['content']!r}")
+    print("==============================")
+    outputs = model.generate(**gen_kwargs)
+    prompt_len = input_ids.shape[1]
+    generated_ids = outputs[0][prompt_len:]
+    response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return response
+
+# Main ZMQ server loop
+if __name__ == "__main__":
+    port = 8888
+    context = zmq.Context()
+    socket = context.socket(zmq.REP)
+    socket.bind(f"tcp://*:{port}")
+    print(f"[START-UP] Server listening on port {port}...")
+
+    first_question = True
+    while True:
+        client_msg = socket.recv_string()
+        print(f"[INFO] Received: {client_msg}")
+
+        if client_msg.strip().upper() == "EXIT":
+            socket.send_string("Goodbye!")
+            print("[EXIT] Shutting down server.")
+            break
+
+        # On first interaction, send the single initial question
+        if first_question and question_bank:
+            first_question = False
+            next_q = question_bank.pop(0)
+            messages.append({"role": "assistant", "content": next_q})
+            socket.send_string(next_q)
+            print(f"[INFO] Sent initial question: {next_q}")
+            continue
+
+        # Append user reply
+        messages.append({"role": "user", "content": client_msg})
+
+        # Build a valid history for generation
+        history_for_gen = build_valid_history(messages)
+
+        # Generate conversational reply
+        try:
+            dynamic_reply = forward_pass(history_for_gen)
+        except Exception as e:
+            dynamic_reply = f"Error during generation: {e}"
+
+        messages.append({"role": "assistant", "content": dynamic_reply})
+
+        # Send only the dynamic reply from here on
+        socket.send_string(dynamic_reply)
+        print(f"[INFO] Sent: {dynamic_reply}")
+
+    # Clean up
+    logout()
+    print("[INFO] Server shutdown complete.")
