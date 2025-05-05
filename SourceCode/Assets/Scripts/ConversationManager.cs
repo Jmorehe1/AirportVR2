@@ -2,137 +2,261 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.Windows.Speech;
+using UnityEngine.SceneManagement;
 using UnityEngine.XR;
 using UnityEngine.XR.Interaction.Toolkit;
-using SpeechGenerationSystem;
+using SpeechLib;
 using UnityText2Speech;
-
- 
-// using SpeechLib; // Old system namespace for SpVoice
 
 public class ConversationManager : MonoBehaviour
 {
+    
     [Header("Config")]
-    public float triggerDelay = 1f;
-    public float animationTriggerChance = 0.5f; // Probability of triggering an animation (50%)
+
+    public float triggerDelay = 1f; //ensures the dictation recognizer will be done in time
 
     [Header("Data")]
-    public List<AudioClip> audioClips;
-    public AudioClip finalClip;
-    public Animator animator; // Animator for triggering animations
+    public List<AudioClip> audioClips; //clips that require responses
+    public AudioClip finalClip; //clip to end experience
 
     [Header("Objects")]
-    public AudioSource audioSource; // AudioSource for playing speech
+    public AudioSource audioSource;
     public ResponsePanel responsePanel;
     public Transform passport;
 
-    // Old SpVoice text-to-speech system
-    // SpVoice Attendant_voice; // Removed the old SpVoice object
 
-    // New Speech System Fields
-    public USgs speechGenerator; // Speech Generation System (replaces SpVoice)
-    public Text inputText; // Text input to be converted to speech
-
+    public Menu menu;
     [Header("Controllers")]
     public List<XRController> controllers;
 
+
+    //Trackers===============
     bool triggerIsDown = false;
-    int voiceLineTracker = -1;
+    int voiceLineTracker = -1; 
+
+    //Misc=======================
+    ServerCommunicator serverCommunicator;
+    SpeechConverter speechConverter;
+    public USgs Attendant_voice;
+    
+    public List<string> questions;
+    int questionIndex = 0;
     public bool beganConvo = false;
+    public List<string> transcript;
+    int t_index = 0;
+    string messageToSend;
+    string response;
+    bool repetitive = true;
+    bool Server_flag = false;
+    public List<string> scores;
+    public List<string> prompts;
+    public int promptIndex = 0;
 
-    private string[] conversationTriggers = { "Conversation1", "Conversation2", "Conversation3", "Conversation4" };
 
-
-
-    void Start()
-    {
-        // Old SpVoice initialization (Removed)
-        // Attendant_voice = new SpVoice();
-        //inputText= new Text();
-        
-        // Initialize the Speech Generation System
-        speechGenerator = GetComponent<USgs>(); // Get the USgs component for speech generation
-        speechGenerator.audioPlayer = audioSource; // Assign the AudioSource for playing speech
-
-        passport.localScale = Vector3.zero; // Set the initial scale of passport (for future interaction)
+    void Awake(){
+       
+        passport.localScale = Vector3.zero;
     }
 
-    void Update()
-    {
-         //For means of testing
-        if (Input.GetKeyDown(KeyCode.S))
+    void Start(){
+        speechConverter = GameObject.FindGameObjectWithTag("SpeechConverter").GetComponent<SpeechConverter>();
+        serverCommunicator = new ServerCommunicator();
+        serverCommunicator.Start();
+        //Attendant_voice = new USgs();
+        prompts.Add("hola");
+        response = "default";
+    }
+
+    
+    void Update(){
+
+        //Below are test cases to test the voices of TTS with english and spanish
+        if(Input.GetKeyDown(KeyCode.S))
         {
+            Attendant_voice.ReceiveTextToSpeech("Didn't we had some fun? Remember when the platform was sliding into the fire pit and I said Goodbye and you were like No way! and I was all We pretended we were going to murder you? That was great");
+        }
+
+        if(Input.GetKeyDown(KeyCode.W))
+        {
+            Attendant_voice.ReceiveTextToSpeech("Buenos dias, bienvenido al Aeropuerto de Bogota. Cual es el proposito de su visita?");
+        }
+
+        // Check if the Enter key is pressed
+        bool enterKeyPressed = Input.GetKeyDown(KeyCode.Return);
+
+        //check to see if either trigger is pressed to proceed with dialogue
+        bool rightHandTrigger = false;
+        controllers[0].inputDevice.TryGetFeatureValue(CommonUsages.triggerButton, out rightHandTrigger);
+
+        bool leftHandTrigger = false;
+        controllers[1].inputDevice.TryGetFeatureValue(CommonUsages.triggerButton, out leftHandTrigger);
+        
+        triggerIsDown = rightHandTrigger || leftHandTrigger || enterKeyPressed;
+        
+    }
+
+    private void OnTriggerEnter(Collider other) {
+        if(other.tag == "Player" && !beganConvo){
+            beganConvo = true;
+            //scoring has been disabled for now
+            //BeginScoring();
+            BeginConversation();
+            BeginVoiceRecording();
+        }
+    }
+    public bool passAnswer = false;
+    void BeginConversation(){
+        passport.transform.localScale = Vector3.one;
+        StartCoroutine(ConversationRoutine());
+        IEnumerator ConversationRoutine(){
+            //yield return new WaitForSeconds(2f);
             
-            // Define an array of three different sentences in Spanish
-            string[] sentences = {
-                "El día está soleado y hermoso.",  // Positive sentence
-                "No me gusta cómo está lloviendo hoy.",  // Negative sentence
-                "Hoy es un día como cualquier otro.",
-                "Esta es una oración de ejemplo que utiliza el nuevo sistema de generación de voz."  // Neutral sentence
-            };
+            Debug.Log("BEGINNING CONVO");
 
-            // Choose a random sentence from the array
-            int randomIndex = Random.Range(0, sentences.Length);
-            string selectedSentence = sentences[randomIndex];
+            ServerCom(prompts[promptIndex]);
+            
+            while(response != null)
+            {
+                //unity check to see if we get the same question twicw move on with another topic. Not really used right now
+                if(repetitive == true)
+                {
+                    StartCoroutine(ServerCom(prompts[promptIndex]));
+                    repetitive = false;
+                }
+                //send message to server
+                else
+                {
+                    StartCoroutine(ServerCom(transcript[voiceLineTracker]));
+                }
+                //wait for server response
+                yield return new WaitUntil(()=>Server_flag);
+                Attendant_voice.ReceiveTextToSpeech(response);
+                voiceLineTracker += 1; //all recorded data added to the
+                Server_flag = false; 
+                yield return new WaitUntil(()=>triggerIsDown);
+                yield return new WaitUntil(()=>!triggerIsDown); //press and release
+                yield return new WaitForSeconds(triggerDelay); // 
+                //if repititive is triggered, move on to another topic in the prompts list
+                if(repetitive)
+                {
+                    promptIndex++;
+                }
+        
+                
+            }
+            //Old code used to use pre recorded questions and scoring instead of an AI model conversation
+            foreach(AudioClip ac in audioClips){
+                audioSource.clip = ac;
+                audioSource.Play();
+                yield return new WaitUntil(()=>audioSource.isPlaying);
+                yield return new WaitUntil(()=>!audioSource.isPlaying);
+                voiceLineTracker += 1; //all recorded data added to the 
+                yield return new WaitUntil(()=>triggerIsDown);
+                yield return new WaitUntil(()=>!triggerIsDown); //press and release
+                yield return new WaitForSeconds(triggerDelay); // 
 
-            // Speak the selected sentence
-            SpeakText(selectedSentence);
+            }
+            
+            // Debug.Log("ALL DONE");
+            audioSource.clip = finalClip;
+            menu.SetDialogueFinished(true);
+            audioSource.Play();
+            yield return new WaitUntil(()=>audioSource.isPlaying);
+            yield return new WaitUntil(()=>!audioSource.isPlaying);
+            voiceLineTracker += 1; 
+            for(int i = 0; i<scores.Count; i++){
 
-            // Classify the sentence as positive, negative, or neutral
-            string classification = "";
-            if (randomIndex == 0) {
-                classification = "positive";
-            } else if (randomIndex == 1) {
-                classification = "negative";
-            } else {
-                classification = "neutral";
+                responsePanel.Fill(transcript[i],scores[i]);
+                if(i<transcript.Count && i <scores.Count){
+                    if(transcript[i] == ""){
+                        transcript[i] = "Error. Speech not recognized.";
+                        scores[i] = "No score provided.";
+                    }
+                    responsePanel.Fill(transcript[i],scores[i]);
+                    yield return new WaitUntil(()=>triggerIsDown);
+                    yield return new WaitUntil(()=>!triggerIsDown);
+                }
+                
             }
 
-            // Log the classification in the console
-            Debug.Log("The selected sentence is: " + classification);
+            GameObject.FindObjectOfType<ScreenFader>().FadeOut();
+            yield return new WaitForSeconds(1.5f);
+            //SceneManager.LoadScene("MainMenu");
+            yield return null;
+        }
+    }
+
+    void BeginVoiceRecording(){
         
-                SpeakText("Esta es una oración de ejemplo que utiliza el nuevo sistema de generación de voz.");
+        //stores answers
+        transcript = new List<string>();
+        foreach(AudioClip ac in audioClips){
+            transcript.Add("");
+        }
+
+        StartCoroutine(VoiceRecordingRoutine());
+
+        IEnumerator VoiceRecordingRoutine(){
+            speechConverter.RequestCache(); //clear the cache
+            yield return new WaitUntil(()=>voiceLineTracker>-1); // wait until we finish our first voice line
+            Debug.Log("VOICE LINES");
+            //store the speech in the corresponding question slot of the transcript list
+            while(response != null){
+                string recordedSpeech = speechConverter.RequestCache();
+                if(recordedSpeech != ""){
+                    Debug.Log(voiceLineTracker + " ADDING TO TRANSCRIPT: " + recordedSpeech);
+                    transcript[voiceLineTracker] += recordedSpeech + " ";
+                }
+                
+                yield return null;
+            }
+            Debug.Log("VOICE LINES OVER");
+            yield return null;
         }
     }
 
-    // Method for triggering speech using the new Speech Generation System
-    void SpeakText(string textToSpeak)
-    {
-        // Old system using SpVoice
-        // Attendant_voice.Speak(textToSpeak, SpeechVoiceSpeakFlags.SVSFlagsAsync | SpeechVoiceSpeakFlags.SVSFPurgeBeforeSpeak);
-        // Randomly decide if an animation should be triggered
 
-        if (Random.value < animationTriggerChance)
-        {
-            TriggerRandomAnimation();
-        }
+    //handles the sending of information to the backend
+    void BeginScoring(){
+        scores = new List<string>();
+        foreach(AudioClip ac in audioClips){scores.Add("ERROR");}
 
-        speechGenerator.ReceiveTextToSpeech(textToSpeak); // Convert and play speech using the Speech Generation System
-    }
+        int cachedLine = voiceLineTracker;
+        
+        StartCoroutine(ScoreRoutine());
+        IEnumerator ScoreRoutine(){
+            yield return new WaitUntil(()=>voiceLineTracker > -1);
+            cachedLine = voiceLineTracker;
+            while(true){
+                yield return new WaitUntil(()=>voiceLineTracker!=cachedLine);
+                Debug.Log(cachedLine);
+                messageToSend = transcript[cachedLine];
+                cachedLine = voiceLineTracker;
 
-    // Method to randomly trigger one of the four conversation animations
-    void TriggerRandomAnimation()
-    {
-        // Select a random index for the animation triggers
-        int randomIndex = Random.Range(0, conversationTriggers.Length);
+                yield return null;
+            }
 
-        // Trigger the selected animation
-        animator.SetTrigger(conversationTriggers[randomIndex]);
-    }
-
-    private void OnTriggerEnter(Collider other)
-    {
-        if (other.tag == "Player" && !beganConvo)
-        {
-            beganConvo = true;
-            BeginConversation();
+            yield return null;
         }
     }
 
-    // Trigger the start of the conversation
-    void BeginConversation()
-    {
-        passport.transform.localScale = Vector3.one; // Show passport object for interaction
-        // Additional logic for starting the conversation...
+    IEnumerator WaitForScore(int index){
+        yield return new WaitUntil(()=>serverCommunicator.GetLastResponse() != "");
+        Debug.Log("RECIEVED SCORE: " + serverCommunicator.GetLastResponse());
+        scores[index] = (serverCommunicator.GetLastResponse());
+        serverCommunicator.AcknowledgeLastResponse();
     }
+
+    //function used to receive responses from the AI model instead of requesting foir a score
+    IEnumerator ServerCom(string msg){
+        serverCommunicator.SendMessage(msg);
+        yield return new WaitUntil(()=>serverCommunicator.GetLastResponse() != "");
+        Debug.Log("RESPONSE: " + serverCommunicator.GetLastResponse());
+        response = serverCommunicator.GetLastResponse();
+        serverCommunicator.AcknowledgeLastResponse();
+        Server_flag = true;
+    }
+
+
 }
